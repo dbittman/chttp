@@ -1,4 +1,4 @@
-SOURCES=main.c 
+SOURCES=main.c mime.c
 OBJECTS=$(SOURCES:.c=.o)
 DEPS=$(SOURCES:.c=.d)
 

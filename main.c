@@ -10,111 +10,16 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <linux/futex.h>
+#include <time.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 
-struct entry {
-	char *key;
-	char *val;
-	size_t vallen;
-};
-
-struct entry *hashtable;
-size_t hashtablelen = 512;
-size_t num_entries = 0;
-
-void ingest(struct entry *table, size_t tablen, char *ext, char *mime);
-/* http://cseweb.ucsd.edu/~kube/cls/100/Lectures/lec16/lec16-16.html */
-size_t hashfn(const char *key, size_t tablen)
-{
-	long hashVal = 0;
-	while (*key != '\0') {
-		hashVal = (hashVal << 4) + *(key++);
-		long g = hashVal & 0xF0000000L;
-		if (g != 0) hashVal ^= g >> 24;
-		hashVal &= ~g;
-	}
-	return hashVal % tablen;
-}
-
-void grow_hashtable(void)
-{
-	size_t newlen = hashtablelen * 2;
-	struct entry *newtable = calloc(newlen, sizeof(struct entry));
-	for(size_t i=0;i<hashtablelen;i++) {
-		struct entry *ent = &hashtable[i];
-		if(ent->key != NULL) {
-			ingest(newtable, newlen, ent->key, ent->val);
-			free(ent->key);
-			free(ent->val);
-		}
-	}
-	free(hashtable);
-	hashtable = newtable;
-	hashtablelen = newlen;
-}
-
-char *lookup(const char *key, size_t *len)
-{
-	size_t index = hashfn(key, hashtablelen);
-	for(size_t i=0;i<hashtablelen;i++) {
-		struct entry *ent = &hashtable[(index + i) % hashtablelen];
-		if(ent->key && !strcmp(ent->key, key)) {
-			*len = ent->vallen;
-			return ent->val;
-		}
-	}
-	return NULL;
-}
-
-/* TODO: better hashing */
-void ingest(struct entry *table, size_t tablen, char *ext, char *mime)
-{
-	size_t index = hashfn(ext, tablen);
-	for(size_t i=0;i<tablen;i++) {
-		struct entry *ent = &table[(index + i) % tablen];
-
-		if(ent->key == NULL) {
-			ent->key = strdup(ext);
-			ent->val = strdup(mime);
-			ent->vallen = strlen(ent->val);
-			return;
-		}
-	}
-	fprintf(stderr, "Mime type hash table too small.\n");
-	abort();
-}
-
-void init_mime_database(void)
-{
-	hashtable = calloc(hashtablelen, sizeof(struct entry));
-	FILE *f = fopen("/etc/mime.types", "r");
-	if(f == NULL) {
-		perror("Failed to open mime database");
-		exit(1);
-	}
-
-	char buffer[1024];
-	while(fgets(buffer, 1024, f)) {
-		if(buffer[0] == '#' || buffer[0] == '\n')
-			continue;
-
-		/* some mime types have multiple extensions */
-		char *mime = strtok(buffer, " \t");
-		char *extension;
-		while((extension = strtok(NULL, " \t\n"))) {
-			ingest(hashtable, hashtablelen, extension, mime);
-			if((num_entries++ * 100) / hashtablelen > 25) {
-				grow_hashtable();
-			}
-		}
-	}
-	printf("mime database initialized with %ld entries\n", num_entries);
-}
+#include "mime.h"
 
 char *server_root = "root";
-int num_threads = 128;
+unsigned num_threads = 128;
 
 int rootfd;
 
@@ -137,7 +42,7 @@ void write_content_type(int client, char *path)
 	char *last_dot = strrchr(path, '.');
 	if(last_dot) {
 		size_t len;
-		char *m = lookup(last_dot + 1, &len);
+		char *m = mime_lookup(last_dot + 1, &len);
 		write(client, m, len);
 	} else {
 		write(client, "text/plain", 10);
@@ -176,6 +81,7 @@ void handle_get(int client, char *buf)
 			}
 		}
 	}
+	close(fd);
 }
 
 #define STACK_LEN 1024
@@ -227,6 +133,8 @@ void thread_client(int client)
 		free(buf);
 }
 
+#define PROFILE 0
+
 void *thread_main(void *data)
 {
 	struct threaddata *td = data;
@@ -234,14 +142,21 @@ void *thread_main(void *data)
 	while(true) {
 		int client = atomic_load(&mailbox[mb]);
 		if(client != 0) {
+#if PROFILE
+			struct timespec start, stop;
+			clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
 			thread_client(client);
+#if PROFILE
+			clock_gettime(CLOCK_MONOTONIC, &stop);
+
+			printf("%ld %ld\n", stop.tv_sec - start.tv_sec, stop.tv_nsec - start.tv_nsec);
+#endif
 
 			atomic_store(&mailbox[mb], 0);
 			atomic_store(&last_mailbox, mb);
 		} else {
-			if(futex((int *)&mailbox[mb], FUTEX_WAIT, 0, NULL, NULL, 0) == -1) {
-				perror("futex");
-			}
+			futex((int *)&mailbox[mb], FUTEX_WAIT, 0, NULL, NULL, 0);
 		}
 	}
 }
@@ -330,9 +245,14 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	printf("Listening!\n");
+	struct rlimit lim;
+	getrlimit(RLIMIT_NOFILE, &lim);
+	if(lim.rlim_cur <= num_threads + 8) {
+		fprintf(stderr, "warning - you have more threads than files. Probably not what you want.\n");
+	}
+	printf("Listening with %d threads, %ld files!\n", num_threads, lim.rlim_cur);
 
-	for(int i=0;i<num_threads;i++) {
+	for(unsigned i=0;i<num_threads;i++) {
 		td[i].tid = i;
 		pthread_create(&threads[i], NULL, thread_main, &td[i]);
 	}
@@ -340,7 +260,7 @@ int main(int argc, char **argv)
 	struct sockaddr_in caddr;
 	socklen_t caddr_len;
 	int client;
-	while((client = accept(sock, (struct sockaddr *)&caddr, &caddr_len)) != -1) {
+	while((client = accept(sock, (struct sockaddr *)&caddr, &caddr_len)) != -1 || 1) {
 		handle_client(client);
 	}
 
