@@ -13,6 +13,9 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/sendfile.h>
 
 #include "mime.h"
 #include "futex.h"
@@ -22,9 +25,18 @@ unsigned num_threads = 128;
 
 int rootfd;
 
+/* virtual servers */
+
 struct threaddata {
 	int tid;
 };
+
+static inline unsigned long long rdtsc(void)
+{
+	unsigned hi, lo;
+	__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+	return ( (unsigned long long)lo)|(((unsigned long long)hi)<<32);
+}
 
 static _Atomic int *mailbox;
 
@@ -44,6 +56,17 @@ void write_content_type(int client, char *path)
 	write(client, "\r\n", 2);
 }
 
+const char *mime_get(char *path)
+{
+	char *last_dot = strrchr(path, '.');
+	if(last_dot) {
+		size_t len;
+		char *ret = mime_lookup(last_dot + 1, &len);
+		return ret ? ret : "text/plain";
+	}
+	return "text/plain";
+}
+
 void handle_get(int client, char *buf)
 {
 	char *path = buf + 5;
@@ -61,19 +84,22 @@ void handle_get(int client, char *buf)
 		const char *err_resp = "HTTP/1.1 404 Not Found\r\n\r\nGo Fish!";
 		write(client, err_resp, strlen(err_resp));
 	} else {
-		char data[1024];
-		ssize_t len;
+		struct stat sb;
+		if(fstat(fd, &sb) == 0) {
+			char response[1024];
+			int len = snprintf(response, 1024,
+					"HTTP/1.1 200 OK\r\n"
+					"Server: chttp\r\n"
+					"Content-Type: %s\r\n"
+					"Content-Length: %ld\r\n"
+					"\r\n",
+					mime_get(path),
+					sb.st_size);
 
-		const char *resp = "HTTP/1.1 200 OK\r\nServer: chttp\r\n";
-		write(client, resp, strlen(resp));
-		write_content_type(client, path);
-		write(client, "\r\n", 2);
+			write(client, response, len);
+			sendfile(client, fd, NULL, sb.st_size);
+		} /* TODO: handle failure? */
 
-		while((len = read(fd, data, 1024)) > 0) {
-			if(write(client, data, len) == -1) {
-				break;
-			}
-		}
 	}
 	close(fd);
 }
@@ -88,12 +114,18 @@ void thread_client(int client)
 	char *buf = _stackbuf;
 	bool alloc = false;
 
-	while((len = read(client, buf, curlen - total)) >= 0 || total == 0) {
+	while((len = read(client, buf + total, curlen - total)) >= 0 || total == 0) {
 		if(len == -1)
 			continue;
+		total += len;
+
+		if(buf[total-1] == '\n' && buf[total-2] == '\r'
+				&& buf[total-3] == '\n' && buf[total-4] == '\r') {
+			break;
+		}
+
 		int flags = fcntl(client, F_GETFL);
 		fcntl(client, F_SETFL, flags | O_NONBLOCK);
-		total += len;
 		if(alloc) {
 			if(total >= curlen) {
 				curlen *= 2;
@@ -121,13 +153,17 @@ void thread_client(int client)
 		write(client, err_resp, strlen(err_resp));
 	}
 
-
 	close(client);
 	if(alloc)
 		free(buf);
 }
 
-#define PROFILE 0
+#define PROFILE 1
+
+#if PROFILE
+unsigned long long mean = 0;
+long _count = 0;
+#endif
 
 void *thread_main(void *data)
 {
@@ -137,14 +173,18 @@ void *thread_main(void *data)
 		int client = atomic_load(&mailbox[mb]);
 		if(client != 0) {
 #if PROFILE
-			struct timespec start, stop;
-			clock_gettime(CLOCK_MONOTONIC, &start);
+			struct timespec start, end;
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start);
+			unsigned long long tsc = rdtsc();
 #endif
 			thread_client(client);
 #if PROFILE
-			clock_gettime(CLOCK_MONOTONIC, &stop);
-
-			printf("%ld %ld\n", stop.tv_sec - start.tv_sec, stop.tv_nsec - start.tv_nsec);
+			unsigned long long tsc2 = rdtsc();
+			mean = ((mean * _count) + (tsc2 - tsc)) / (_count + 1);
+			_count++;
+			printf("%lld, %lld\n", tsc2 - tsc, mean);
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
+			printf(":: %ld\n", (end.tv_nsec - start.tv_nsec));
 #endif
 
 			atomic_store(&mailbox[mb], 0);
@@ -191,8 +231,13 @@ void parse_cmd_opts(int argc, char **argv)
 	}
 }
 
+void handler(int sig)
+{
+	exit(0);
+}
 int main(int argc, char **argv)
 {
+	signal(SIGINT, handler);
 	parse_cmd_opts(argc, argv);
 	rootfd = open(server_root, O_RDONLY);
 	if(rootfd == -1) {
