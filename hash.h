@@ -1,8 +1,11 @@
 #pragma once
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 struct entry {
 	char *key;
-	char *val;
-	size_t vallen;
+	void *val;
 };
 
 struct hashtable {
@@ -18,7 +21,7 @@ static inline void hash_init(struct hashtable *h)
 	h->table = calloc(h->len, sizeof(struct entry));
 }
 
-static inline void hash_ingest(struct hashtable *, char *ext, char *mime);
+static inline void hash_ingest(struct hashtable *, char *ext, void *);
 /* http://cseweb.ucsd.edu/~kube/cls/100/Lectures/lec16/lec16-16.html */
 static inline size_t __hashfn(const char *key, size_t tablen)
 {
@@ -45,7 +48,6 @@ static inline void grow_hashtable(struct hashtable *h)
 		if(ent->key != NULL) {
 			hash_ingest(&nh, ent->key, ent->val);
 			free(ent->key);
-			free(ent->val);
 		}
 	}
 	free(h->table);
@@ -65,16 +67,15 @@ static inline struct entry *hash_lookup(struct hashtable *h, const char *key)
 	return NULL;
 }
 
-static void hash_ingest(struct hashtable *h, char *ext, char *mime)
+static void hash_ingest(struct hashtable *h, char *key, void *val)
 {
-	size_t index = __hashfn(ext, h->len);
+	size_t index = __hashfn(key, h->len);
 	for(size_t i=0;i<h->len;i++) {
 		struct entry *ent = &h->table[(index + i) % h->len];
 
 		if(ent->key == NULL) {
-			ent->key = strdup(ext);
-			ent->val = strdup(mime);
-			ent->vallen = strlen(ent->val);
+			ent->key = strdup(key);
+			ent->val = val;
 			if((h->count++) * 100 / h->len > 25)
 				grow_hashtable(h);
 			return;

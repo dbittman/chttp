@@ -19,13 +19,13 @@
 
 #include "mime.h"
 #include "futex.h"
+#include "hash.h"
+#include "vsrv.h"
 
-char *server_root = "root";
+/* github: http://github.com/dbittman/chttp */
+
+char *default_server_root = "root";
 unsigned num_threads = 128;
-
-int rootfd;
-
-/* virtual servers */
 
 struct threaddata {
 	int tid;
@@ -42,32 +42,17 @@ static _Atomic int *mailbox;
 
 static _Atomic long last_mailbox = 0;
 
-void write_content_type(int client, char *path)
-{
-	write(client, "Content-Type: ", 14);
-	char *last_dot = strrchr(path, '.');
-	if(last_dot) {
-		size_t len;
-		char *m = mime_lookup(last_dot + 1, &len);
-		write(client, m, len);
-	} else {
-		write(client, "text/plain", 10);
-	}
-	write(client, "\r\n", 2);
-}
-
 const char *mime_get(char *path)
 {
 	char *last_dot = strrchr(path, '.');
 	if(last_dot) {
-		size_t len;
-		char *ret = mime_lookup(last_dot + 1, &len);
+		char *ret = mime_lookup(last_dot + 1);
 		return ret ? ret : "text/plain";
 	}
 	return "text/plain";
 }
 
-void handle_get(int client, char *buf)
+void handle_get(struct server *srv, int client, char *buf)
 {
 	char *path = buf + 5;
 	char *space = strchr(path, ' ');
@@ -78,7 +63,7 @@ void handle_get(int client, char *buf)
 		path = "index.html";
 	}
 
-	int fd = openat(rootfd, path, O_RDONLY);
+	int fd = openat(srv->rootfd, path, O_RDONLY);
 	if(fd == -1) {
 		/* send err */
 		const char *err_resp = "HTTP/1.1 404 Not Found\r\n\r\nGo Fish!";
@@ -102,6 +87,12 @@ void handle_get(int client, char *buf)
 
 	}
 	close(fd);
+}
+
+void bad_request(int client)
+{
+	const char *err_resp = "HTTP/1.1 400 Bad Request\r\n\r\nBad Request!";
+	write(client, err_resp, strlen(err_resp));
 }
 
 #define STACK_LEN 1024
@@ -146,11 +137,21 @@ void thread_client(int client)
 		return;
 	}
 	
-	if(!strncmp(buf, "GET", 3)) {
-		handle_get(client, buf);
+	char *host = strstr(buf, "Host: ");
+	if(!host) {
+		bad_request(client);
 	} else {
-		const char *err_resp = "HTTP/1.1 400 Bad Request\r\n\r\nBad Request!";
-		write(client, err_resp, strlen(err_resp));
+		char *servername = host + 6;
+		char *col = strchr(servername, ':');
+		if(col) *col = 0;
+		struct server *srv = server_lookup(servername);
+		if(col) *col = ':';
+
+		if(!strncmp(buf, "GET", 3)) {
+			handle_get(srv, client, buf);
+		} else {
+			bad_request(client);
+		}
 	}
 
 	close(client);
@@ -158,17 +159,21 @@ void thread_client(int client)
 		free(buf);
 }
 
-#define PROFILE 1
+#define PROFILE 0
 
-#if PROFILE
-unsigned long long mean = 0;
-long _count = 0;
-#endif
+/* TODO: make this configurable */
+#define TIMEOUT 10000
 
 void *thread_main(void *data)
 {
+#if PROFILE
+	static unsigned long long mean = 0;
+	static long _count = 0;
+	static unsigned long long meanns = 0;
+#endif
 	struct threaddata *td = data;
 	int mb = td->tid;
+	int timeout = TIMEOUT;
 	while(true) {
 		int client = atomic_load(&mailbox[mb]);
 		if(client != 0) {
@@ -180,16 +185,18 @@ void *thread_main(void *data)
 			thread_client(client);
 #if PROFILE
 			unsigned long long tsc2 = rdtsc();
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
 			mean = ((mean * _count) + (tsc2 - tsc)) / (_count + 1);
+			meanns = ((meanns * _count) + (end.tv_nsec - start.tv_nsec)) / (_count + 1);
 			_count++;
 			printf("%lld, %lld\n", tsc2 - tsc, mean);
-			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
-			printf(":: %ld\n", (end.tv_nsec - start.tv_nsec));
+			printf(":: %ld %lld\n", (end.tv_nsec - start.tv_nsec), meanns);
 #endif
 
 			atomic_store(&mailbox[mb], 0);
 			atomic_store(&last_mailbox, mb);
-		} else {
+		} else if(--timeout == 0) {
+			timeout = TIMEOUT;
 			futex((int *)&mailbox[mb], FUTEX_WAIT, 0, NULL, NULL, 0);
 		}
 	}
@@ -197,9 +204,15 @@ void *thread_main(void *data)
 
 void handle_client(int client)
 {
+#if PROFILE
+	static unsigned long mean;
+	static unsigned long _count;
+	unsigned long long tsc = rdtsc();
+#endif
+	int mb;
 	while(true) {
 		int expect = 0;
-		int mb = atomic_load(&last_mailbox) % num_threads;
+		mb = atomic_load(&last_mailbox) % num_threads;
 		if(atomic_compare_exchange_strong(&mailbox[mb], &expect, client)) {
 			futex((int *)&mailbox[mb], FUTEX_WAKE, 1, NULL, NULL, 0);
 			break;
@@ -207,6 +220,12 @@ void handle_client(int client)
 
 		atomic_fetch_add(&last_mailbox, 1);
 	}
+#if PROFILE
+	unsigned long long tsc2 = rdtsc();
+	mean = ((mean * _count) + (tsc2 - tsc)) / (_count + 1);
+	_count++;
+	printf("enqueue %lld, %ld (to %d)\n", tsc2 - tsc, mean, mb);
+#endif
 }
 
 void parse_cmd_opts(int argc, char **argv)
@@ -233,19 +252,35 @@ void parse_cmd_opts(int argc, char **argv)
 
 void handler(int sig)
 {
-	exit(0);
+	(void)sig;
+	exit(1);
 }
 int main(int argc, char **argv)
 {
 	signal(SIGINT, handler);
 	parse_cmd_opts(argc, argv);
-	rootfd = open(server_root, O_RDONLY);
-	if(rootfd == -1) {
+
+	default_server.name = "[default]";
+	default_server.rootfd = open(default_server_root, O_RDONLY);
+
+	if(default_server.rootfd == -1) {
 		perror("Failed to open server root");
 		exit(1);
 	}
 	
 	init_mime_database();
+	hash_init(&server_hash);
+	
+	/* temporary test virtual servers */
+	struct server joe;
+	joe.name = "joe.org";
+	joe.rootfd = open("joe", O_RDONLY);
+	hash_ingest(&server_hash, joe.name, &joe);
+	struct server bob;
+	bob.name = "bob.com";
+	bob.rootfd = open("bob", O_RDONLY);
+	hash_ingest(&server_hash, bob.name, &bob);
+
 
 	mailbox = calloc(num_threads, sizeof(int));
 	pthread_t threads[num_threads];

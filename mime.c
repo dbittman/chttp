@@ -5,11 +5,10 @@
 #include "hash.h"
 
 static struct hashtable mime_table;
-char *mime_lookup(const char *key, size_t *len)
+char *mime_lookup(const char *key)
 {
 	struct entry *e = hash_lookup(&mime_table, key);
 	if(e) {
-		*len = e->vallen;
 		return e->val;
 	}
 	return NULL;
@@ -33,7 +32,7 @@ void init_mime_database(void)
 		char *mime = strtok(buffer, " \t");
 		char *extension;
 		while((extension = strtok(NULL, " \t\n"))) {
-			hash_ingest(&mime_table, extension, mime);
+			hash_ingest(&mime_table, extension, strdup(mime));
 		}
 	}
 	printf("mime database initialized with %ld entries\n", mime_table.count);

@@ -1,8 +1,8 @@
-SOURCES=main.c mime.c
+SOURCES=main.c mime.c vsrv.c
 OBJECTS=$(SOURCES:.c=.o)
 DEPS=$(SOURCES:.c=.d)
 
-CFLAGS=-Og -g -std=gnu11 -Wall -Wextra
+CFLAGS=-O3 -g -std=gnu11 -Wall -Wextra
 LDFLAGS=-lpthread
 
 all: chttp
