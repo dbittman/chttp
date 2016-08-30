@@ -11,7 +11,6 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <sys/time.h>
-#include <sys/syscall.h>
 #include <fcntl.h>
 #include <sys/resource.h>
 
@@ -253,9 +252,9 @@ int main(int argc, char **argv)
 	}
 
 	struct sockaddr_in caddr;
-	socklen_t caddr_len;
+	socklen_t caddr_len = sizeof(caddr);
 	int client;
-	while((client = accept(sock, (struct sockaddr *)&caddr, &caddr_len)) != -1 || 1) {
+	while((client = accept(sock, (struct sockaddr *)&caddr, &caddr_len)) != -1) {
 		handle_client(client);
 	}
 
