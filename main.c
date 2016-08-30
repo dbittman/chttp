@@ -9,7 +9,6 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdatomic.h>
-#include <linux/futex.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
@@ -17,6 +16,7 @@
 #include <sys/resource.h>
 
 #include "mime.h"
+#include "futex.h"
 
 char *server_root = "root";
 unsigned num_threads = 128;
@@ -28,11 +28,6 @@ struct threaddata {
 };
 
 static _Atomic int *mailbox;
-
-static int futex(int *uaddr, int futex_op, int val, const struct timespec *timeout, int *uaddr2, int val3)
-{
-    return syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3);
-}
 
 static _Atomic long last_mailbox = 0;
 
