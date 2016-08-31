@@ -25,7 +25,8 @@
 /* github: http://github.com/dbittman/chttp */
 
 char *default_server_root = "root";
-unsigned num_threads = 128;
+unsigned num_threads = 8;
+const int max_files_per_server = 16;
 
 struct threaddata {
 	int tid;
@@ -52,6 +53,81 @@ const char *mime_get(char *path)
 	return "text/plain";
 }
 
+#include "resource.h"
+
+void lru_update(struct server *srv, struct resource *r)
+{
+	pthread_mutex_lock(&srv->lru_lock);
+	if(srv->lru == r) {
+		pthread_mutex_unlock(&srv->lru_lock);
+		return;
+	}
+	if(srv->lru) {
+		if(r->next) {
+			r->next->prev = r->prev;
+		}
+		if(r->prev) {
+			r->prev->next = r->next;
+		}
+
+		r->prev = srv->lru->prev;
+		r->next = srv->lru;
+	} else {
+		r->next = r;
+		r->prev = r;
+	}
+	srv->lru = r;
+	r->next->prev = r;
+	r->prev->next = r;
+	pthread_mutex_unlock(&srv->lru_lock);
+}
+
+void lru_reclaim(struct server *srv)
+{
+	pthread_mutex_lock(&srv->lru_lock);
+	if(srv->lru == NULL) {
+		pthread_mutex_unlock(&srv->lru_lock);
+		return;
+	}
+
+	struct resource *last = srv->lru->prev;
+	while(srv->open_files > max_files_per_server && last != srv->lru) {
+		struct resource *prv = last->prev;
+		if(pthread_rwlock_trywrlock(&last->rwlock) == 0) {
+			close(last->fd);
+			last->fd = -1;
+			srv->open_files--;
+			last->prev->next = last->next;
+			last->next->prev = last->prev;
+			last->next = last->prev = NULL;
+			pthread_rwlock_unlock(&last->rwlock);
+		}
+		last = prv;
+	}
+
+	pthread_mutex_unlock(&srv->lru_lock);
+}
+
+struct resource *http_header_cache_lookup(struct server *srv, const char *path)
+{
+	/* TODO: look through some of LRU ? */
+	struct entry *e = hash_lookup(&srv->resources, path);
+	return e ? e->val : NULL;
+}
+
+void http_header_cache_insert(struct server *srv, const char *path, struct resource *resp)
+{
+	hash_ingest(&srv->resources, path, resp);
+	lru_update(srv, resp);
+}
+
+void internal_server_error(struct server *srv, int client)
+{
+	(void)srv;
+	const char *err_resp = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
+	write(client, err_resp, strlen(err_resp));
+}
+
 void handle_get(struct server *srv, int client, char *buf)
 {
 	char *path = buf + 5;
@@ -63,30 +139,73 @@ void handle_get(struct server *srv, int client, char *buf)
 		path = "index.html";
 	}
 
-	int fd = openat(srv->rootfd, path, O_RDONLY);
-	if(fd == -1) {
-		/* send err */
-		const char *err_resp = "HTTP/1.1 404 Not Found\r\n\r\nGo Fish!";
-		write(client, err_resp, strlen(err_resp));
+	struct resource *resp = http_header_cache_lookup(srv, path);
+	if(resp) {
+		pthread_rwlock_rdlock(&resp->rwlock);
+		if(srv->lru != resp) {
+			lru_update(srv, resp);
+		}
+		if(resp->fd == -1) {
+			if(srv->open_files++ > max_files_per_server) {
+				lru_reclaim(srv);
+			}
+			resp->fd = openat(srv->rootfd, path, O_RDONLY);
+			if(resp->fd) {
+				internal_server_error(srv, client);
+				pthread_rwlock_unlock(&resp->rwlock);
+				return;
+			}
+		}
+		write(client, resp->response, resp->resp_len);
+		off_t zero = 0;
+		sendfile(client, resp->fd, &zero, resp->cont_len);
+		pthread_rwlock_unlock(&resp->rwlock);
 	} else {
-		struct stat sb;
-		if(fstat(fd, &sb) == 0) {
-			char response[1024];
-			int len = snprintf(response, 1024,
-					"HTTP/1.1 200 OK\r\n"
-					"Server: chttp\r\n"
-					"Content-Type: %s\r\n"
-					"Content-Length: %ld\r\n"
-					"\r\n",
-					mime_get(path),
-					sb.st_size);
+		int fd = openat(srv->rootfd, path, O_RDONLY);
+		if(srv->open_files++ > max_files_per_server) {
+			lru_reclaim(srv);
+		}
+		if(fd == -1) {
+			/* send err */
+			const char *err_resp = "HTTP/1.1 404 Not Found\r\n\r\nGo Fish!";
+			write(client, err_resp, strlen(err_resp));
+		} else {
+			struct stat sb;
+			if(fstat(fd, &sb) == 0) {
+				resp = malloc(sizeof(struct resource));
+				resp->resp_len = snprintf(resp->response, 1024,
+						"HTTP/1.1 200 OK\r\n"
+						"Server: chttp\r\n"
+						"Content-Type: %s\r\n"
+						"Content-Length: %ld\r\n"
+						"\r\n",
+						mime_get(path),
+						resp->cont_len = sb.st_size);
 
-			write(client, response, len);
-			sendfile(client, fd, NULL, sb.st_size);
-		} /* TODO: handle failure? */
-
+				write(client, resp->response, resp->resp_len);
+				sendfile(client, fd, NULL, resp->cont_len);
+				resp->fd = fd;
+				resp->next = resp->prev = NULL;
+				pthread_rwlock_init(&resp->rwlock, NULL);
+				strncpy(resp->path, path, PATH_MAX);
+				http_header_cache_insert(srv, path, resp);
+			} else {
+				/* TODO: handle failure? */
+				close(fd);
+			}
+		}
 	}
-	close(fd);
+#if 0
+	struct resource *r = srv->lru;
+	if(!r)
+		printf("Empty!\n");
+	else {
+		do {
+			printf("LRU entry: %s (%p) <%p   >%p\n", r->path, r, r->prev, r->next);
+			r = r->next;
+		} while(r != srv->lru);
+	}
+#endif
 }
 
 void bad_request(int client)
@@ -136,7 +255,7 @@ void thread_client(int client)
 		close(client);
 		return;
 	}
-	
+
 	char *host = strstr(buf, "Host: ");
 	if(!host) {
 		bad_request(client);
@@ -257,11 +376,13 @@ void handler(int sig)
 }
 int main(int argc, char **argv)
 {
+	setbuf(stdout, NULL);
 	signal(SIGINT, handler);
 	parse_cmd_opts(argc, argv);
 
 	default_server.name = "[default]";
 	default_server.rootfd = open(default_server_root, O_RDONLY);
+	hash_init(&default_server.resources);
 
 	if(default_server.rootfd == -1) {
 		perror("Failed to open server root");
@@ -271,16 +392,11 @@ int main(int argc, char **argv)
 	init_mime_database();
 	hash_init(&server_hash);
 	
-	/* temporary test virtual servers */
 	struct server joe;
-	joe.name = "joe.org";
-	joe.rootfd = open("joe", O_RDONLY);
-	hash_ingest(&server_hash, joe.name, &joe);
 	struct server bob;
-	bob.name = "bob.com";
-	bob.rootfd = open("bob", O_RDONLY);
-	hash_ingest(&server_hash, bob.name, &bob);
-
+	vsrv_init(&default_server, "[default]", "root");
+	vsrv_init(&bob, "bob.com", "bob");
+	vsrv_init(&joe, "joe.org", "joe");
 
 	mailbox = calloc(num_threads, sizeof(int));
 	pthread_t threads[num_threads];

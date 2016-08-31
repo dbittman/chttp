@@ -21,7 +21,7 @@ static inline void hash_init(struct hashtable *h)
 	h->table = calloc(h->len, sizeof(struct entry));
 }
 
-static inline void hash_ingest(struct hashtable *, char *ext, void *);
+static inline void hash_ingest(struct hashtable *, const char *ext, void *);
 /* http://cseweb.ucsd.edu/~kube/cls/100/Lectures/lec16/lec16-16.html */
 static inline size_t __hashfn(const char *key, size_t tablen)
 {
@@ -67,7 +67,7 @@ static inline struct entry *hash_lookup(struct hashtable *h, const char *key)
 	return NULL;
 }
 
-static void hash_ingest(struct hashtable *h, char *key, void *val)
+static void hash_ingest(struct hashtable *h, const char *key, void *val)
 {
 	size_t index = __hashfn(key, h->len);
 	for(size_t i=0;i<h->len;i++) {
