@@ -1,3 +1,11 @@
+/* http server in C, just writing some code for fun. Hopefully it's fast :)
+ *
+ * https://github.com/dbittman
+ * https://twitter.com/danielbittman
+ */
+
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -22,7 +30,6 @@
 #include "hash.h"
 #include "vsrv.h"
 
-/* github: http://github.com/dbittman/chttp */
 
 char *default_server_root = "root";
 unsigned num_threads = 8;
@@ -128,15 +135,12 @@ void internal_server_error(struct server *srv, int client)
 	write(client, err_resp, strlen(err_resp));
 }
 
-void handle_get(struct server *srv, int client, char *buf)
+void bad_request(int client);
+void handle_get(struct server *srv, int client, char *path)
 {
-	char *path = buf + 5;
-	char *space = strchr(path, ' ');
-	if(space) {
-		*space = '\0';
-	}
 	if(path[0] == '\0') {
-		path = "index.html";
+		bad_request(client);
+		return;
 	}
 
 	struct resource *resp = http_header_cache_lookup(srv, path);
@@ -178,7 +182,7 @@ void handle_get(struct server *srv, int client, char *buf)
 						"Server: chttp\r\n"
 						"Content-Type: %s\r\n"
 						"Content-Length: %ld\r\n"
-						"\r\n",
+							"\r\n",
 						mime_get(path),
 						resp->cont_len = sb.st_size);
 
@@ -212,6 +216,26 @@ void bad_request(int client)
 {
 	const char *err_resp = "HTTP/1.1 400 Bad Request\r\n\r\nBad Request!";
 	write(client, err_resp, strlen(err_resp));
+}
+
+void handle_response(struct server *srv, int client, char *res)
+{
+	char *method = res;
+	char *space = strchr(method, ' ');
+	if(!space) {
+		bad_request(client);
+		return;
+	}
+	*space = '\0';
+	char *url = space + 1;
+	while(*url == '/') {
+		url++;
+	}
+	if(!strcmp(method, "GET")) {
+		handle_get(srv, client, url);
+	} else {
+		bad_request(client);
+	}
 }
 
 #define STACK_LEN 1024
@@ -266,11 +290,25 @@ void thread_client(int client)
 		struct server *srv = server_lookup(servername);
 		if(col) *col = ':';
 
-		if(!strncmp(buf, "GET", 3)) {
-			handle_get(srv, client, buf);
-		} else {
-			bad_request(client);
+		/* TODO: check for allowed HTTP methods first */
+
+		char result[1024];
+		size_t len = 1024;
+		enum route_result res = route_request(srv, buf, result, &len);
+
+		switch(res) {
+			case ROUTE_ERROR:
+				bad_request(client);
+				break;
+			case ROUTE_NOMATCH:
+				handle_response(srv, client, buf);
+				break;
+			case ROUTE_MATCH:
+				handle_response(srv, client, result);
+				break;
 		}
+
+		/* TODO: route responses as well */
 	}
 
 	close(client);
@@ -369,6 +407,21 @@ void parse_cmd_opts(int argc, char **argv)
 	}
 }
 
+void parse_server(struct server *srv, const char *config_path)
+{
+	FILE *f = fopen(config_path, "r");
+
+	char *name, *root, *route;
+	int s = fscanf(f, "name:%ms\n", &name);
+	s = fscanf(f, "root:%ms\n", &root);
+	while(fscanf(f, "route:%m[^\n]\n", &route) > 0) {
+		printf("%s\n", route);
+	}
+
+	/* TODO: construct regex from these routes */
+	
+}
+
 void handler(int sig)
 {
 	(void)sig;
@@ -376,6 +429,9 @@ void handler(int sig)
 }
 int main(int argc, char **argv)
 {
+	//parse_server(NULL, "joe.conf");
+	//exit(1);
+
 	setbuf(stdout, NULL);
 	signal(SIGINT, handler);
 	parse_cmd_opts(argc, argv);
